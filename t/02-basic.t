@@ -1,33 +1,32 @@
-# much of this test code is blatently ripped out of the test code from
-# Ogg::Vorbis::Header.
-# This is in part due to laziness and in part to try to ensure the
-# two modules share the same API.
+use strict;
+use warnings;
 
-#########################
-
-# change 'tests => 1' to 'tests => last_test_to_print';
-
-use Test::More tests => 8;
+use Test::More;
+use FindBin;
 use Ogg::Vorbis::Header::PurePerl;
 
-#########################
+my @test_files = qw/test.ogg/;
 
-# See if partial load works
-ok(my $ogg = Ogg::Vorbis::Header::PurePerl->new('t/test.ogg'));
+chdir $FindBin::Bin;
 
-# Try all the routines
-ok($ogg->info->{'rate'} == 44100);
-ok($ogg->comment_tags);
-ok($ogg->comment('artist')->[0] == 'maloi');
+for my $fn (@test_files) {
 
-$ogg = 0;
+    ok( my $ogg = Ogg::Vorbis::Header::PurePerl->new($fn)->load_comments,
+        "Loaded test file" );
 
-# See if full load works
-ok(my $ogg = Ogg::Vorbis::Header::PurePerl->new('t/test.ogg'));
-ok($ogg->comment('artist')->[0] == 'maloi');
+    my $info = $ogg->info();
+    ok( $info->{sample_rate} == 48000, "Sample rate matched" );
+    ok( int($info->{length}) == 16,    "Track length matched" );
 
-# and see if we can get comments including the '=' character
-ok($ogg->comment('album')->[0] == 'this=that');
+    my @tags = $ogg->comment_tags();
+    ok( $tags[3] eq 'genre', "Tag order matched" );
+    for my $t (@tags) {
+        print "$t\n";
+        print "\t$_\n" for ($ogg->comment($t));
+    }
+    ok( ($ogg->comment('performer')) eq 'Chiara Bertoglio', "Performer matched" );
 
-# Make sure we're getting the right track length
-ok($ogg->info->{'length'} == 0);
+}
+
+done_testing();
+exit;

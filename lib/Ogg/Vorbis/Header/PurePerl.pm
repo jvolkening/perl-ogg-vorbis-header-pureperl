@@ -1,488 +1,714 @@
-package Ogg::Vorbis::Header::PurePerl;
+package Ogg::Vorbis::Header::PurePerl 2.000;
 
-use 5.006;
+use 5.012;
 use strict;
 use warnings;
 
-# First four bytes of stream are always OggS
-use constant OGGHEADERFLAG => 'OggS';
+use Carp;
+use Digest::CRC;
+use List::Util qw/sum min/;
+use POSIX qw/floor/;
+use Scalar::Util qw/blessed/;
+use Cwd qw/abs_path/;
+use File::Copy qw/move/;
 
-our $VERSION = '1.01';
+use constant OGG_CAPTURE       => 'OggS';
+use constant HEADER_IDENT      => 1;
+use constant HEADER_COMMENT    => 3;
+use constant HEADER_SETUP      => 5;
+use constant VORBIS_PREFIX_LEN => 7;
+use constant IDENT_PAGE_LEN    => 58;
+use constant MAX_SEG_LEN       => 255;
+use constant MAX_SEGS_PER_PAGE => 255;
 
 sub new {
-	my $class = shift;
-	my $file  = shift;
 
-	my %data  = ();
+    my ($class, $fn) = @_;
 
-	if (ref $file) {
-		binmode $file;
+    my $self = bless {}, $class;
 
-		%data = (
-			'filesize'   => -s $file,
-			'fileHandle' => $file,
-		);
+    croak "Error reading $fn" if (! -r $fn);
+    $self->{fn} = abs_path($fn);
 
-	} else {
+    return $self;
 
-		open FILE, $file or do {
-			warn "$class: File $file does not exist or cannot be read: $!";
-			return undef;
-		};
+}
 
-		# make sure dos-type systems can handle it...
-		binmode FILE;
+#----------------------------------------------------------------------------#
+# Public methods
+#----------------------------------------------------------------------------#
 
-		%data = (
-			'filename'   => $file,
-			'filesize'   => -s $file,
-			'fileHandle' => \*FILE,
-		);
-	}
+sub load {
 
-	if ( _init(\%data) ) {
-		_loadInfo(\%data);
-		_loadComments(\%data);
-		_calculateTrackLength(\%data);
-	}
+    my ($self, $fn) = @_;
 
-	undef $data{'fileHandle'};
-	close FILE;
+    # called as instance method
+    if (blessed($self) eq 'Ogg::Vorbis::Header::PurePerl') {
+        carp "Filename is ignored when Ogg::Vorbis::Header::PurePerl::load"
+            . " is called as instance method" if (defined $fn);
+    }
+    else {
+        $self = Ogg::Vorbis::Header::PurePerl->new($fn);
+    }
 
-	return bless \%data, $class;
+    return $self->load_comments();
+
+}
+
+sub load_comments {
+
+    my ($self) = @_;
+
+    open my $fh, '<:raw', $self->{fn}
+        or croak "Error opening $self->{fn} for reading";
+    $self->{fh} = $fh;
+    
+    $self->{curr_offset} = 0;
+    $self->{curr_page}   = -1;
+    $self->{file_size}   = -s $self->{fh};
+    $self->{crc} = 1; # should start defined but not initialized
+
+    $self->_parse_headers();
+
+    close $self->{fh};
+    $self->{fh} = undef;
+
+    return $self;
+
 }
 
 sub info {
-	my $self = shift;
-	my $key = shift;
 
-	# if the user did not supply a key, return the entire hash
-	return $self->{'INFO'} unless $key;
+    my ($self, $key) = @_;
 
-	# otherwise, return the value for the given key
-	return $self->{'INFO'}{lc $key};
+	# if the user supplied a key, return associated value
+	# otherwise, return entire info hash
+	return  (defined $key) ? $self->{info}->{lc $key} : $self->{info};
+
 }
 
 sub comment_tags {
-	my $self = shift;
 
-	my %keys = ();
+    my ($self) = @_;
 
-	return grep( !$keys{$_}++, @{$self->{'COMMENT_KEYS'}});
+    # return an array of key values (including duplicates)
+    return sort map {
+        ($_) x scalar(@{ $self->{comments}->{$_} })
+    } keys %{ $self->{comments} };
+
 }
 
 sub comment {
-	my $self = shift;
-	my $key = shift;
 
-	# if the user supplied key does not exist, return undef
-	return undef unless($self->{'COMMENTS'}{lc $key});
+    my ($self, $key) = @_;
 
+    # return comment(s) associated with given key
+    $key = lc $key;
+
+	return undef unless(defined $self->{comments}->{$key});
 	return wantarray 
-		? @{$self->{'COMMENTS'}{lc $key}}
-		: $self->{'COMMENTS'}{lc $key}->[0];
+		? sort @{$self->{'comments'}->{$key}}
+		: (sort @{$self->{'comments'}->{$key}})[0];
+
 }
+
+sub add_comments {
+
+    my ($self, @comments) = @_;
+
+    # add one or more key/value pairs to comments
+    croak "Odd number of arguments" if (scalar(@comments) % 2);
+    my @keys = @comments[ map {$_*2}   0..int($#comments/2) ];
+    my @vals = @comments[ map {$_*2+1} 0..int($#comments/2) ];
+
+    for (0..$#keys) {
+        
+        croak "invalid key name"   if (! _is_valid_key($keys[$_]) );
+        croak "invalid value name" if (! _is_valid_value($vals[$_]) );
+        utf8::encode($vals[$_])    if ( utf8::is_utf8($vals[$_]) );
+        #$self->{comments}->{$keys[$_]} = []
+            #if (! defined $self->{comments}->{$keys[$_]} );
+        push @{ $self->{comments}->{$keys[$_]} }, $vals[$_];
+
+    }
+
+}
+
+sub edit_comment {
+
+    my ($self, $key, $value, $idx)  = @_;
+    $idx = $idx // 0;
+
+    croak "invalid value" if (! _is_valid_value($value));
+    utf8::encode($value)  if ( utf8::is_utf8($value) );
+
+    return undef if (! defined $self->{comments}->{$key});
+    my @vals = sort @{ $self->{comments}->{$key}};
+    return undef if ( $#vals < $idx );
+
+    my $old = splice @vals, $idx, 1, $value;
+    $self->{comments}->{$key} = [@vals];
+
+    return $old;
+
+}
+
+sub delete_comment {
+
+    my ($self, $key, $idx)  = @_;
+    $idx = $idx // 0;
+
+    return undef if (! defined $self->{comments}->{$key});
+    my @vals = sort @{ $self->{comments}->{$key}};
+    return undef if ( $#vals < $idx );
+    my $old = splice @vals, $idx, 1;
+    if (scalar(@vals) < 1) {
+        delete $self->{comments}->{$key};
+    }
+    else {
+        $self->{comments}->{$key} = [@vals];
+    }
+
+    return $old;
+
+}
+
+sub clear_comments {
+
+    my ($self, @keys) = @_;
+
+    if (scalar @keys) {
+        for (@keys) {
+            return undef if (! defined $self->{comments}->{$_});
+            delete $self->{comments}->{$_};
+        }
+    }
+    else {
+        $self->{comments} = {};
+    }
+
+    return 1;
+
+}
+
 
 sub path {
-	my $self = shift;
 
-	return $self->{'fileName'};
+    my ($self) = @_;
+    return $self->{fn};
+
 }
 
-# "private" methods
-sub _init {
-	my $data = shift;
+#----------------------------------------------------------------------------#
+# Private methods
+#----------------------------------------------------------------------------#
 
-	# check the header to make sure this is actually an Ogg-Vorbis file
-	$data->{'startInfoHeader'} = _checkHeader($data) || return undef;
-	
-	return 1;
+sub _parse_vorbis_prefix {
+
+    my ($self) = @_;
+
+    # From Section 4.2.1;
+    #  Each header packet begins with the same header fields.
+    #  
+    #  1    1) [packet_type] : 8 bit value
+    #  2    2) 0x76, 0x6f, 0x72, 0x62, 0x69, 0x73: the characters ’v’,’o’,’r’,’b’,’i’,’s’ as six octets
+
+    my ($type, $magic) = unpack 'CA*', $self->_ogg_read(VORBIS_PREFIX_LEN);
+    croak "Malformed vorbis packet" if ($magic ne 'vorbis');
+    
+    return $type;
+
 }
 
-sub _skipID3Header {
-	my $fh = shift;
+sub _parse_headers {
 
-	read $fh, my $buffer, 3;
-	
-	my $byteCount = 3;
-	
-	if ($buffer eq 'ID3') {
+    my ($self) = @_;
 
-		while (read $fh, $buffer, 4096) {
+    seek $self->{fh}, 0, 0;
 
-			my $found;
-			if (($found = index($buffer, OGGHEADERFLAG)) >= 0) {
-				$byteCount += $found;
-				seek $fh, $byteCount, 0;
-				last;
-			} else {
-				$byteCount += 4096;
-			}
-		}
+    # parse identification and comment headers, and determine offsets and
+    # lengths of all three header packets
 
-	} else {
-		seek $fh, 0, 0;
-	}
+    # initialize first packet
+    $self->{packet_lens} = [0];
 
-	return tell($fh);
+    # parse initial Ogg page header
+    $self->_load_page();
+    # Now we should be at start of ident header
+
+    #-------------------------------------------------------------------------
+    # Identfication header 
+    #-------------------------------------------------------------------------
+
+    $self->{headers}->{ident}->{file_offset} = tell $self->{fh};
+    $self->{headers}->{ident}->{page_offset} = $self->{page_offset};
+    $self->{headers}->{ident}->{page_len}    = $self->{page_len};
+
+    # parse vorbis prefix and advance
+    my $type = $self->_parse_vorbis_prefix();
+    croak "Not an identification header" if ($type ne HEADER_IDENT);
+
+    # unpack header data
+    my @values = unpack 'VCVVVVAC', $self->_ogg_read(23);
+    my @keys = qw/ version channels sample_rate bitrate_max bitrate_nom
+        bitrate_min blocksize_0 blocksize_1 /;
+
+    $values[7] = vec($values[7],0,1); # framing bit is first bit of last byte
+
+    croak "Parse error: framing flag not set" if (pop @values != 1);
+
+    # split and recalculate blocksizes ( two four bit exponents );
+    my @blocksizes = map { 2 ** vec($values[6],$_,4) } 0..1;
+    splice @values, 6, 1, @blocksizes;
+
+    # generate the hash
+    $self->{info} = { map {$keys[$_] => $values[$_]} 0..$#keys };
+
+    # Identification header should always cover a single page (as per spec)
+    croak "Identification packet does not end at page boundary"
+        if ($self->{page_offset} != 0);
+
+    #-------------------------------------------------------------------------
+    # Comments header 
+    #-------------------------------------------------------------------------
+
+    $self->{headers}->{comment}->{file_offset} = tell $self->{fh};
+    $self->{headers}->{comment}->{page_offset} = $self->{page_offset};
+    $self->{headers}->{comment}->{page_len}    = $self->{page_len};
+
+    # parse vorbis prefix and advance
+    $type = $self->_parse_vorbis_prefix();
+    croak "Not a comment header" if ($type ne HEADER_COMMENT);
+
+    # unpack header data
+    my $vendor_len       = unpack 'V',  $self->_ogg_read(4);
+    $self->{vendor_name} = unpack "A*", $self->_ogg_read($vendor_len);
+    my $comment_count    = unpack 'V',  $self->_ogg_read(4);
+    
+    # iterate through comments
+    for (1..$comment_count) {
+        my $comment_len = unpack 'V', $self->_ogg_read(4);
+
+        # this is awkward, since key is always single byte chars but value
+        # can have wide chars (so we assume the presence of wide)
+        my $t = tell $self->{fh};
+        my $comment
+            = join '', (map {chr($_)} (unpack 'U*', $self->_ogg_read($comment_len)));
+        my $diff = tell($self->{fh}) - $t;
+        my ($key,$value,@other) = split '=', $comment; 
+        croak "invalid comment" if (scalar(@other) > 0);
+        croak "invalid field name $key" if ($key =~ /[^\x{20}-\x{7d}]/);
+        $key = lc($key);
+        $self->{comments}->{$key} = []
+            if (! defined $self->{comments}->{$key});
+        push @{ $self->{comments}->{$key} }, $value;
+    }
+
+    # verify correct framing bit
+    my $framing_bit = vec( $self->_ogg_read(1) ,0 ,1);
+    croak "bad framing bit at end of comment packet\n"
+        if (! $framing_bit);
+
+    #-------------------------------------------------------------------------
+    # Setup header 
+    #-------------------------------------------------------------------------
+
+    $self->{headers}->{setup}->{file_offset} = tell $self->{fh};
+    $self->{headers}->{setup}->{page_offset} = $self->{page_offset};
+    $self->{headers}->{setup}->{page_len}    = $self->{page_len};
+
+    # We don't actually parse the setup header (run away!) but we need to know
+    # the length in order to re-write the Vorbis file if asked. This is done
+    # by loading additional pages until at least four packet lengths are in
+    # memory - the first three then should be complete and represent the
+    # header packets
+
+    while (scalar @{$self->{packet_lens}} < 4) {
+        my $left_in_page = $self->{page_len} - $self->{page_offset};
+        seek $self->{fh}, $left_in_page, 1;
+        $self->_load_page();
+    }
+    
+    $self->{last_header_page} = $self->{curr_page};
+
+    $self->{headers}->{ident}->{length}   = $self->{packet_lens}->[0];
+    $self->{headers}->{comment}->{length} = $self->{packet_lens}->[1];
+    $self->{headers}->{setup}->{length}   = $self->{packet_lens}->[2];
+    delete $self->{packet_lens};
+    delete $self->{crc};
+
+    $self->_calc_track_len();
+    return;
+
 }
 
-sub _checkHeader {
-	my $data = shift;
+sub _calc_track_len {
 
-	my $fh = $data->{'fileHandle'};
-	my $buffer;
-	my $pageSegCount;
+    my ($self) = @_;
 
-	# stores how far into the file we've read, so later reads into the file can
-	# skip right past all of the header stuff
+    my $backset = min(
+        $self->{info}->{blocksize_1}*2,
+        $self->{file_size}
+    );
 
-	my $byteCount = _skipID3Header($fh);
-	
-	# Remember the start of the Ogg data
-	$data->{startHeader} = $byteCount;
+    seek $self->{fh}, -$backset, 2;
+    read($self->{fh}, my $chunk, $backset);
 
-	# check that the first four bytes are 'OggS'
-	read($fh, $buffer, 27);
+    my $gran = 0;
+    while ($chunk =~ /OggS/g) {
+        
+        seek $self->{fh}, pos($chunk) - $backset - 4, 2;
+        my ($flags, $g) = $self->_load_page();
+            if ($flags & 0x04) {
+                $gran = $g;
+            }
+            else {
+                croak "EOF but not last page - corrupt file?\n";
+            }
+    }
 
-	if (substr($buffer, 0, 4) ne OGGHEADERFLAG) {
-		warn "This is not an Ogg bitstream (no OggS header).";
-		return undef;
-	}
+    $self->{info}->{length} = $self->{info}->{sample_rate}
+        ? $gran/$self->{info}->{sample_rate}
+        : 0;
 
-	$byteCount += 4;
-
-	# check the stream structure version (1 byte, should be 0x00)
-	if (ord(substr($buffer, 4, 1)) != 0x00) {
-		warn "This is not an Ogg bitstream (invalid structure version).";
-		return undef;
-	}
-
-	$byteCount += 1;
-
-	# check the header type flag 
-	# This is a bitfield, so technically we should check all of the bits
-	# that could potentially be set. However, the only value this should
-	# possibly have at the beginning of a proper Ogg-Vorbis file is 0x02,
-	# so we just check for that. If it's not that, we go on anyway, but
-	# give a warning (this behavior may (should?) be modified in the future.
-	if (ord(substr($buffer, 5, 1)) != 0x02) {
-		warn "Invalid header type flag (trying to go ahead anyway).";
-	}
-
-	$byteCount += 1;
-
-	# read the number of page segments
-	$pageSegCount = ord(substr($buffer, 26, 1));
-	$byteCount += 21;
-
-	# read $pageSegCount bytes, then throw 'em out
-	seek($fh, $pageSegCount, 1);
-	$byteCount += $pageSegCount;
-
-	# check packet type. Should be 0x01 (for indentification header)
-	read($fh, $buffer, 7);
-	if (ord(substr($buffer, 0, 1)) != 0x01) {
-		warn "Wrong vorbis header type, giving up.";
-		return undef;
-	}
-
-	$byteCount += 1;
-
-	# check that the packet identifies itself as 'vorbis'
-	if (substr($buffer, 1, 6) ne 'vorbis') {
-		warn "This does not appear to be a vorbis stream, giving up.";
-		return undef;
-	}
-
-	$byteCount += 6;
-
-	# at this point, we assume the bitstream is valid
-	return $byteCount;
 }
 
-sub _loadInfo {
-	my $data = shift;
 
-	my $start = $data->{'startInfoHeader'};
-	my $fh    = $data->{'fileHandle'};
+sub _load_page {
 
-	my $byteCount = $start + 23;
-	my %info = ();
+    my ($self) = @_;
 
-	seek($fh, $start, 0);
+    # check previous CRC if present
+    if (ref($self->{crc})) {
+        my $calc = $self->{crc}->digest;
+        croak "CRC32 mismatch" if ($calc != $self->{crc_given});
 
-	# read the vorbis version
-	read($fh, my $buffer, 23);
-	$info{'version'} = _decodeInt(substr($buffer, 0, 4, ''));
+    }
 
-	# read the number of audio channels
-	$info{'channels'} = ord(substr($buffer, 0, 1, ''));
+    # handle EOF situations
+    if (eof $self->{fh}) {
+        $self->{page_len} = 0;
+        $self->{page_offset} = 0;
+        $self->{crc} = undef;
+        return;
+    }
 
-	# read the sample rate
-	$info{'rate'} = _decodeInt(substr($buffer, 0, 4, ''));
+    if (defined $self->{crc}) {
+        $self->{crc} = Digest::CRC->new(
+            width  => 32,
+            poly   => 0x04c11db7,
+            init   => 0,
+            xorout => 0,
+            refin  => 0,
+            refout => 0,
+        );
+    }
 
-	# read the bitrate maximum
-	$info{'bitrate_upper'} = _decodeInt(substr($buffer, 0, 4, ''));
+    my $t_start = tell $self->{fh};
 
-	# read the bitrate nominal
-	$info{'bitrate_nominal'} = _decodeInt(substr($buffer, 0, 4, ''));
+    read $self->{fh}, my $buf, 27;
+    my ($capture_pattern,
+        $stream_struct_vers,
+        $header_type_flag,
+        $abs_gran_pos,
+        $stream_SN,
+        $page_num,
+        $crc32,
+        $num_segments
+    )  = unpack 'A4CCQ<VVVC', $buf;
 
-	# read the bitrate minimal
-	$info{'bitrate_lower'} = _decodeInt(substr($buffer, 0, 4, ''));
+    croak "Invalid Ogg header"
+        if ($capture_pattern ne OGG_CAPTURE);
+    
+    $self->{sn} = $stream_SN if (! defined $self->{sn});
+    $self->{crc_given} = $crc32;
 
-	# read the blocksize_0 and blocksize_1
-	# these are each 4 bit fields, whose actual value is 2 to the power
-	# of the value of the field
-	my $blocksize = substr($buffer, 0, 1, '');
-	$info{'blocksize_0'} = 2 << ((ord($blocksize) & 0xF0) >> 4);
-	$info{'blocksize_1'} = 2 << (ord($blocksize) & 0x0F);
+    # zero out CRC for digest check
+    substr $buf, 22, 4, pack('C4', 0);
+    $self->{crc}->add( $buf )
+        if (ref($self->{crc}));
 
-	# read the framing_flag
-	$info{'framing_flag'} = ord(substr($buffer, 0, 1, ''));
+    read $self->{fh}, $buf, $num_segments;
+    $self->{crc}->add( $buf )
+        if (ref($self->{crc}));
+    my @segment_sizes = unpack 'C*', $buf;
+    $self->{page_len} = 0;
+    for (0..$#segment_sizes) {
+        my $l = $segment_sizes[$_];
+        $self->{page_len}          += $l;
+        $self->{packet_lens}->[-1] += $l
+            if (defined $self->{packet_lens});
 
-	# bitrate_window is -1 in the current version of vorbisfile
-	$info{'bitrate_window'} = -1;
+        # Vorbis spec says that segment lengths of 255 indicate that packet
+        # continues in next segment. Anything < 255 indicates the last segment
+        # of the current packet. If a packet happens to end with a segment of
+        # exactly 255 bytes, an empty segment of length 0 is added to conform
+        # to the specification
 
-	$data->{'startCommentHeader'} = $byteCount;
+        push @{ $self->{packet_lens} }, 0 if ($l < 255);
+    }
 
-	$data->{'INFO'} = \%info;
+    $self->{page_header_len} = tell($self->{fh}) - $t_start;
+
+    $self->{page_offset} = 0;
+    #croak "pages out of order" if ($page_num != $self->{curr_page} + 1);
+    $self->{curr_page} = $page_num;
+    return ($header_type_flag, $abs_gran_pos);
+
 }
 
-sub _loadComments {
-	my $data = shift;
+sub _ogg_read {
 
-	my $fh    = $data->{'fileHandle'};
-	my $start = $data->{'startHeader'};
+    # reads a given number of bytes, checking return values and "turning"
+    # Ogg pages as necessary
 
-	$data->{COMMENT_KEYS} = [];
+    my ($self, $bytes) = @_;
 
-	# Comment parsing code based on Image::ExifTool::Vorbis
-	my $MAX_PACKETS = 2;
-	my $done;
-	my ($page, $packets, $streams) = (0,0,0,0);
-	my ($buff, $flag, $stream, %val);
+    my $remaining = $bytes;
+    my $to_return = '';
+    my $buf = '';
 
-	seek $fh, $start, 0;
+    while ($remaining > 0) {
 
-	while (1) {	
-		if (!$done && read( $fh, $buff, 28 ) == 28) {
-			# validate magic number
-			unless ( $buff =~ /^OggS/ ) {
-				warn "No comment header?";
-				last;
-			}
+        my $left_on_page = $self->{page_len} - $self->{page_offset};
 
-			$flag   = Get8u(\$buff, 5);	# page flag
-			$stream = Get32u(\$buff, 14);	# stream serial number
-			++$streams if $flag & 0x02;	# count start-of-stream pages
-			++$packets unless $flag & 0x01; # keep track of packet count
-		}
-		else {
-			# all done unless we have to process our last packet
-			last unless %val;
-			($stream) = sort keys %val;     # take a stream
-			$flag = 0;                      # no continuation
-			$done = 1;                      # flag for done reading
-		}
-		
-		# can finally process previous packet from this stream
-		# unless this is a continuation page
-		if (defined $val{$stream} and not $flag & 0x01) {
-			_processComments( $data, \$val{$stream} );
-			delete $val{$stream};
-			# only read the first $MAX_PACKETS packets from each stream
-			if ($packets > $MAX_PACKETS * $streams) {
-				# all done (success!)
-				last unless %val;
-				# process remaining stream(s)
-				next;
-			}
-		}
+        if ($remaining < $left_on_page) {
+            my $r = read $self->{fh}, $buf, $remaining;
+            $remaining -= $r;
+            $self->{page_offset} += $r;
+            $self->{crc}->add($buf)
+                if (ref($self->{crc}));
+            $to_return .= $buf;
+        }
+        # else rotate pages during read
+        else {
+            my $r = read $self->{fh}, $buf, $left_on_page;
+            $remaining -= $r;
+            $self->{page_offset} += $r;
+            $to_return .= $buf;
+            $self->{crc}->add($buf)
+                if (ref($self->{crc}));
+            $self->_load_page() if ($self->{page_offset} == $self->{page_len});
+        }
 
-		# stop processing Ogg Vorbis if we have scanned enough packets
-		last if $packets > $MAX_PACKETS * $streams and not %val;
-		
-		# continue processing the current page
-		# page sequence number
-		my $pageNum = Get32u(\$buff, 18);
+    }
 
-		# number of segments
-		my $nseg    = Get8u(\$buff, 26);
+    return $to_return;
 
-		# calculate total data length
-		my $dataLen = Get8u(\$buff, 27);
-		
-		if ($nseg) {
-			read( $fh, $buff, $nseg-1 ) == $nseg-1 or last;
-			my @segs = unpack('C*', $buff);
-			# could check that all these (but the last) are 255...
-			foreach (@segs) { $dataLen += $_ }
-		}
-
-		if (defined $page) {
-			if ($page == $pageNum) {
-				++$page;
-			} else {
-				warn "Missing page(s) in Ogg file\n";
-				undef $page;
-			}
-		}
-		
-		# read page data
-		read($fh, $buff, $dataLen) == $dataLen or last;
-
-		if (defined $val{$stream}) {
-			# add this continuation page
-			$val{$stream} .= $buff;
-		} elsif (not $flag & 0x01) {
-			# ignore remaining pages of a continued packet
-			# ignore the first page of any packet we aren't parsing
-			if ($buff =~ /^(.)vorbis/s and ord($1) == 3) {
-				# save this page, it has comments
-				$val{$stream} = $buff;
-			}
-		}
-		
-		if (defined $val{$stream} and $flag & 0x04) {
-			# process Ogg Vorbis packet now if end-of-stream bit is set
-			_processComments($data, \$val{$stream});
-			delete $val{$stream};
-		}
-	}
-	
-	$data->{'INFO'}{offset} = tell $fh;
 }
 
-sub _processComments {
-	my ( $data, $dataPt ) = @_;
-	
-	my $pos = 7;
-	my $end = length $$dataPt;
-	
-	my $num;
-	my %comments;
-	
-	while (1) {
-		last if $pos + 4 > $end;
-		my $len = Get32u($dataPt, $pos);
-		last if $pos + 4 + $len > $end;
-		my $start = $pos + 4;
-		my $buff = substr($$dataPt, $start, $len);
-		$pos = $start + $len;
-		my ($tag, $val);
-		if (defined $num) {
-			$buff =~ /(.*?)=(.*)/s or last;
-			($tag, $val) = ($1, $2);
-		} else {
-			$tag = 'vendor';
-			$val = $buff;
-			$num = ($pos + 4 < $end) ? Get32u($dataPt, $pos) : 0;
-			$pos += 4;
-		}
-		
-		my $lctag = lc $tag;
-		
-		push @{$comments{$lctag}}, $val;
-		push @{$data->{COMMENT_KEYS}}, $lctag;
-		
-		# all done if this was our last tag
-		if ( !$num-- ) {
-			$data->{COMMENTS} = \%comments;
-			return 1;
-		}
-	}
-	
-	warn "format error in Vorbis comments\n";
-	
-	return 0;
+sub write_vorbis {
+
+    my ($self, $fn) = @_;
+
+    my $overwrite = 0;
+    my $fh_out;
+
+    if (! defined $fn) {
+        my ($tmp_fh, $tmp_fn) = tempfile();
+        binmode $tmp_fh;
+        $fn     = $tmp_fn;
+        $fh_out = $tmp_fh;
+        $overwrite = 1;
+    }
+
+    else {
+        open $fh_out, '>:raw', $fn;
+    }
+
+    # Steps for writing:
+
+    # 1. Write the identification header as-is
+
+    # 2. Repack the second and third headers, tracking page counts. The end of
+    # the third header packet should be the end of the page.
+
+    # 3. Output the rest of the file (audio packets), updating the page
+    # numbering if necessary
+
+
+    #-------------------------------------------------------------------------
+    # Write ident header 
+    #-------------------------------------------------------------------------
+
+    # The identification header packet, per spec, takes up exactly one 58 bit
+    # page. We'll just forward it verbatim as is since it's already been
+    # validated earlier.
+
+    open my $fh, '<:raw', $self->{fn};
+    $self->{fh} = $fh;
+
+    seek $self->{fh}, 0, 0;
+    read $self->{fh}, my $head, IDENT_PAGE_LEN;
+    print {$fh_out} $head;
+
+    #-------------------------------------------------------------------------
+    # Write comment and setup header 
+    #-------------------------------------------------------------------------
+    
+    # The second and third headers are written together, as they are allowed
+    # to span multiple pages. Combined, they must begin and end on page
+    # boundaries.
+
+    # In order to pack, we first generate and hold the actual header contents
+    # in memory. Then we wrap them in Ogg pages and print.
+
+    my $comment_packet = '';
+
+    # pack prefix
+    $comment_packet = pack 'CA*', 3, 'vorbis';
+
+    # pack vendor name
+    my $vendor_packed = pack "A*", $self->{vendor_name};
+    $comment_packet .= pack "VA*",
+        length($self->{vendor_name}), $self->{vendor_name};
+
+    # pack comment count
+    my $comment_count  = scalar map {@{ $self->{comments}->{$_} }} keys %{ $self->{comments} };
+    $comment_packet .= pack 'V', $comment_count;
+
+    # pack comments
+    my @s = sort {$a cmp $b} keys %{ $self->{comments} };
+    for my $key (@s) {
+        my @sv = sort {$a cmp $b} @{ $self->{comments}->{$key}};
+        for my $value (@sv) {
+            $comment_packet .= pack 'V', length("$key=$value");
+            $comment_packet .= "$key=$value";
+        }
+    }
+
+    # pack framing bit
+    $comment_packet .= pack 'C', 1;
+
+    my $setup_packet = '';
+    
+
+    # Now read in setup header and add verbatim
+
+    my $header_meta      = $self->{headers}->{setup};
+    $self->{page_offset} = $header_meta->{page_offset};
+    $self->{page_len}    = $header_meta->{page_len};
+    seek $self->{fh}, $header_meta->{file_offset}, 0;
+
+    $setup_packet .= $self->_ogg_read( $header_meta->{length} );
+
+    seek $self->{fh}, -$self->{page_header_len}, 1;
+    # Note that we should now be at the start of the audio stream
+
+    # Now re-wrap the whole thing in Ogg page(s)
+
+    my $curr_page = 1; # comment header always starts on page 1 (0-based)
+    my $paginated = '';
+
+    my $c_l = length($comment_packet);
+    my $s_l = length($setup_packet);
+    my @c_seg_lens = ( (MAX_SEG_LEN) x floor($c_l/MAX_SEG_LEN), $c_l % MAX_SEG_LEN);
+    my @s_seg_lens = ( (MAX_SEG_LEN) x floor($s_l/MAX_SEG_LEN), $s_l % MAX_SEG_LEN);
+    my @seg_lens = ( @c_seg_lens, @s_seg_lens );
+    my $combined_packets = $comment_packet . $setup_packet;
+    
+    my $data_added = 0;
+    my $flag = 0;
+    while (scalar(@seg_lens) > 0) {
+        my $segs_this_page = min( scalar(@seg_lens), MAX_SEGS_PER_PAGE );
+        my @seg_lens_this_page = splice @seg_lens, 0, $segs_this_page;
+        my $page = pack 'A4CCQ<VVVC*',
+            'OggS',
+            0,
+            $flag,
+            0,
+            $self->{sn},
+            $curr_page++,
+            0,
+            $segs_this_page,
+            @seg_lens_this_page;
+
+        my $data_len = sum @seg_lens_this_page;
+        $page .= substr $combined_packets, 0, $data_len, '';
+        $data_added += $data_len;
+        $flag = $flag | 0x01
+            if ($data_added != $self->{headers}->{comment}->{length});
+
+        # added as much data as we will to this page
+
+        # update CRC32 field
+        my $d = Digest::CRC->new(
+            width  => 32,
+            poly   => 0x04c11db7,
+            init   => 0,
+            xorout => 0,
+            refin  => 0,
+            refout => 0,
+        );
+        my $crc32 = $d->add($page)->digest;
+        substr $page, 22, 4, pack('V', $crc32);
+
+        print {$fh_out} $page;
+
+        
+    }
+
+    # now write audio data
+
+    # if re-wrapping hasn't changed page count, just dump the rest of the file
+    # verbatim
+    if ($curr_page - 1 == $self->{last_header_page}) {
+        my $buf = '';
+        print {$fh_out} $buf while (read $self->{fh}, $buf, 4096);
+    }
+    # otherwise we have to re-write the page count of each page
+    else {
+        while ($self->_load_page()) {
+            my $page = '';
+            seek $self->{fh}, -$self->{page_header_len}, 1;
+            my $h = '';
+            read $self->{fh}, $h, $self->{page_header_len};
+            substr $h, 18, 8, pack('VV',$curr_page++,0);
+            $page .= $h;
+            read $self->{fh}, my $s, $self->{page_len};
+            $page .= $s;
+            my $d = Digest::CRC->new(
+                width  => 32,
+                poly   => 0x04c11db7,
+                init   => 0,
+                xorout => 0,
+                refin  => 0,
+                refout => 0,
+            );
+            my $crc32 = $d->add($page)->digest;
+            substr $page, 22, 4, pack('V',$crc32);
+            print {$fh_out} $page;
+        }
+    }
+    close $fh_out;
+    close $self->{fh};
+    $self->{fh} = undef;
+
+    if ($overwrite) {
+        move $fn => $self->{fn};
+    }
+
 }
 
-sub Get8u {
-	return unpack( "x$_[1] C", ${$_[0]} );
+sub _is_valid_value {
+
+    my ($value) = @_;
+
+    # Vorbis specs allow comment values to contain any UTF-8 character
+    # with the exception of the field delimiter 0x3D (equals sign)
+    return ($value =~ / \x{3D} /x) ? 0 : 1;
+
 }
 
-sub Get32u {
-	return unpack( "x$_[1] V", ${$_[0]} );
-}
+sub _is_valid_key {
 
-sub _calculateTrackLength {
-	my $data = shift;
+    my ($key) = @_;
 
-	my $fh = $data->{'fileHandle'};
+    # Vorbis specs allow comment keys to contain any ASCII character between
+    # 0x20 and 0x7D, inclusive, with the exception of the field delimiter 0x3D
+    # (equals sign)
+    return ($key =~ m/(?: [^\x{20}-\x{7d}] | \x{3D} )/x) ? 0 : 1
 
-	# The original author was doing something pretty lame, and was walking the
-	# entire file to find the last granule_position. Instead, let's seek to
-	# the end of the file - blocksize_0, and read from there.
-	my $len = 0;
-
-	# Bug 1155 - Seek further back to get the granule_position.
-	# However, for short tracks, don't seek that far back.
-	if (($data->{'filesize'} - $data->{'INFO'}{'offset'}) > ($data->{'INFO'}{'blocksize_0'} * 2)) {
-
-		$len = $data->{'INFO'}{'blocksize_0'} * 2;
-	} else {
-		$len = $data->{'INFO'}{'blocksize_0'};
-	}
-
-	if ($len == 0) {
-		print "Ogg::Vorbis::Header::PurePerl:\n";
-		warn "blocksize_0 is 0! Should be a power of 2! http://www.xiph.org/ogg/vorbis/doc/vorbis-spec-ref.html\n";
-		return;
-	}
-
-	seek($fh, -$len, 2);
-	read($fh, my $buf, $len);
-
-	my $foundHeader = 0;
-
-	for (my $i = 0; $i < $len; $i++) {
-
-		last if length($buf) < 4;
-
-		if (substr($buf, $i, 4) eq OGGHEADERFLAG) {
-			substr($buf, 0, ($i+4), '');
-			$foundHeader = 1;
-			last;
-		}
-	}
-
-	unless ($foundHeader) {
-		warn "Ogg::Vorbis::Header::PurePerl: Didn't find an ogg header - invalid file?\n";
-		return;
-	}
-
-	# stream structure version - must be 0x00
-	if (ord(substr($buf, 0, 1, '')) != 0x00) {
-		warn "Ogg::Vorbis::Header::PurePerl: Invalid stream structure version: " . sprintf("%x", ord($buf));
-		return;
- 	}
-
- 	# absolute granule position - this is what we need!
-	substr($buf, 0, 1, '');
-
- 	my $granule_position = _decodeInt(substr($buf, 0, 8, ''));
-
-	if ($granule_position && $data->{'INFO'}{'rate'}) {
-		$data->{'INFO'}{'length'}          = int($granule_position / $data->{'INFO'}{'rate'});
-		$data->{'INFO'}{'bitrate_average'} = sprintf( "%d", ( $data->{'filesize'} * 8 ) / $data->{'INFO'}{'length'} );
-	}
-}
-
-sub _decodeInt {
-	my $bytes = shift;
-
-	my $numBytes = length($bytes);
-	my $num = 0;
-	my $mult = 1;
-
-	for (my $i = 0; $i < $numBytes; $i ++) {
-
-		$num += ord(substr($bytes, 0, 1, '')) * $mult;
-		$mult *= 256;
-	}
-
-	return $num;
 }
 
 1;
@@ -491,118 +717,111 @@ __END__
 
 =head1 NAME
 
-Ogg::Vorbis::Header::PurePerl - access Ogg Vorbis info and comment fields
+Ogg::Vorbis::Header::PurePerl - Read and write Ogg Vorbis metadata headers
 
 =head1 SYNOPSIS
 
-	use Ogg::Vorbis::Header::PurePerl;
-	my $ogg = Ogg::Vorbis::Header::PurePerl->new("song.ogg");
-	while (my ($k, $v) = each %{$ogg->info}) {
-		print "$k: $v\n";
-	}
-	foreach my $com ($ogg->comment_tags) {
-		print "$com: $_\n" foreach $ogg->comment($com);
-	}
+    use Ogg::Vorbis::Header::PurePerl
+
+    my $ogg = Ogg::Vorbis::Header::PurePerl->new('song.ogg');
+
 
 =head1 DESCRIPTION
 
-This module is intended to be a drop in replacement for Ogg::Vorbis::Header,
-implemented entirely in Perl.  It provides an object-oriented interface to
-Ogg Vorbis information and comment fields.  (NOTE: This module currently 
-supports only read operations).
-
-Unlike Ogg::Vorbis::Header, this module will go ahead and fill in all of the
-information fields as soon as you construct the object.
+This module provides read/write access to Ogg Vorbis header fields. It is
+intended to be a drop-in pure-Perl replacement for Ogg::Vorbis::Header.
 
 =head1 CONSTRUCTORS
 
-=head2 C<new ($filename)>
+=over 4
 
-Opens an Ogg Vorbis file, ensuring that it exists and is actually an
-Ogg Vorbis stream.  This method does not actually read any of the
-information or comment fields, and closes the file immediately. 
+=item new ($filename)
 
-=head1 INSTANCE METHODS
+Creates a class instance tied to the given filename. The only check that is
+currently performed is that the filename given is available for reading.
 
-=head2 C<info ([$key])>
+=back
 
-Returns a hashref containing information about the Ogg Vorbis file from
-the file's information header.  Hash fields are: version, channels, rate,
-bitrate_upper, bitrate_nominal, bitrate_lower, bitrate_window, and length.
-The bitrate_window value is not currently used by the vorbis codec, and 
-will always be -1.  
+=head1 METHODS
 
-The optional parameter, key, allows you to retrieve a single value from
-the object's hash.  Returns C<undef> if the key is not found.
+=over 4
 
-=head2 C<comment_tags ()>
+=item load_comments
 
-Returns an array containing the key values for the comment fields. 
-These values can then be passed to C<comment> to retrieve their values.
+Reads the comment data from the filenamed tied to the object.
 
-=head2 C<comment ($key)>
+=item load ([filename])
 
-Returns an array of comment values associated with the given key.
+This method is included for backward compatiblity with Ogg::Vorbis::Header,
+which allows it to be called as either a constructor or instance method. In
+this implementation, when called as an instance method (no arguments allowed)
+it is simply an alias for C<load_comments>. When called as a class method, it
+both instantiates the object and loads the comment data. In other words,
 
-=head2 C<add_comments ($key, $value, [$key, $value, ...])>
+    my $ogg = Ogg::Vorbis::Header::PurePerl->load('song.ogg')
 
-Unimplemented.
+is the equivalent of
+    
+    my $ogg = Ogg::Vorbis::Header::PurePerl->new('song.ogg')
+    $ogg->load_comments();
 
-=head2 C<edit_comment ($key, $value, [$num])>
+and it's usage as a constructor is discouraged in new code due to the somewhat
+unexpected syntax. A better one-liner would be
 
-Unimplemented.
+    my $ogg = Ogg::Vorbis::Header::PurePerl->new('song.ogg')->load_comments();
 
-=head2 C<delete_comment ($key, [$num])>
+=item info ([$key])
 
-Unimplemented.
+Returns technical information about the Ogg Vorbis file from the information
+header. Hash fields are:
 
-=head2 C<clear_comments ([@keys])>
+    * version
 
-Unimplemented.
+    * channels
 
-=head2 C<write_vorbis ()>
+    * rate
 
-Unimplemented.
+    * bitrate_upper
 
-=head2 C<path ()>
+    * bitrate_nominal
 
-Returns the path/filename of the file the object represents.
+    * bitrate_lower
 
-=head1 SEE ALSO
+    * bitrate_window
 
-L<Ogg::Vorbis::Decoder> - module for decoding Ogg Vorbis files.
-Requires a C compiler.
+    * length
 
-L<Ogg::Vorbis::Header> - another module for accessing Ogg Vorbis header info.
+If $key is provided, returns a scalar that value from the information header.
+Otherwise returns a hashref containing all data fields. An error is thrown if
+$key is invalid (this deviates from the behavior of Ogg::Vorbis::Header).
 
-L<Ogg::Vorbis> - a perl interface to the
-L<libvorbisfile|http://www.xiph.org/vorbis/doc/vorbisfile/> library,
-for decoding and manipulating Vorbis audio streams.
+=back
 
-=head1 REPOSITORY
+=head1 DEPENDENCIES
 
-L<https://github.com/dsully/perl-ogg-vorbis-header-pureperl>
+=head1 CAVEATS AND BUGS
 
-=head1 AUTHOR
+Please report bugs to the author.
 
-Andrew Molloy E<lt>amolloy@kaizolabs.comE<gt>
+=head1 AUTHORS
 
-Dan Sully E<lt>daniel | at | cpan.orgE<gt>
+Jeremy Volkening <jdv@base2bio.com>
 
-=head1 COPYRIGHT
- 
-Copyright (c) 2003, Andrew Molloy.  All Rights Reserved.
- 
-Copyright (c) 2005-2009, Dan Sully.  All Rights Reserved.
+=head1 COPYRIGHT AND LICENSE
 
-This program is free software; you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the
-Free Software Foundation; either version 2 of the License, or (at
-your option) any later version.  A copy of this license is included
-with this module (LICENSE.GPL).
+Copyright 2015-2016 Jeremy Volkening
 
-=head1 SEE ALSO
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
 
-L<Ogg::Vorbis::Header>, L<Ogg::Vorbis::Decoder>
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+details.
+
+You should have received a copy of the GNU General Public License along with
+this program.  If not, see <http://www.gnu.org/licenses/>.
 
 =cut

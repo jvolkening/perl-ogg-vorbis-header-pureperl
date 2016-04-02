@@ -46,7 +46,7 @@ WriteMakefile(
     ),
 
     ($mm_ver >= 6.48
-        ? (MIN_PERL_VERSION => 5.006)
+        ? (MIN_PERL_VERSION => 5.012)
         : ()
     ),
 
@@ -63,5 +63,7 @@ WriteMakefile(
             },
           })
     ),
+    dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
+    clean => { FILES => 'Ogg-Vorbis-Header-PurePerl-*' },
 
 );
