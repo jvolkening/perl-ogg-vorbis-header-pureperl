@@ -10,6 +10,7 @@ my @REQUIRES = (
     'strict'    => 0,
     'warnings'  => 0,
     'constant'  => 0,
+    'Digest::CRC' => 0,
 );
 
 my @TEST_REQUIRES = (
